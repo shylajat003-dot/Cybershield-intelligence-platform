@@ -1,0 +1,2 @@
+-- Migration 001: Initial Schema
+-- Read from init.sql
