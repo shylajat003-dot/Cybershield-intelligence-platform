@@ -12,10 +12,10 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Write-Host "==========================================================" -ForegroundColor Cyan
 Write-Host "🛡️  CyberShield Automated Deployment Credential Setup" -ForegroundColor Cyan
 Write-Host "==========================================================" -ForegroundColor Cyan
-Write-Host "Your tokens are entered securely via masked inputs (*)." -ForegroundColor Gray
-Write-Host "They are held in process memory only - NEVER written to disk.`n" -ForegroundColor Gray
+Write-Host "All credentials are read via masked inputs (*)." -ForegroundColor Gray
+Write-Host "Credentials exist only in process memory - NEVER written to disk.`n" -ForegroundColor Gray
 
-# Prompt for Render API Key if not present in environment
+# 1. Prompt for Render API Key if not present in environment
 $renderKey = $env:RENDER_API_KEY
 if (-not $renderKey) {
     $secRender = Read-Host "Enter Render API Key (from dashboard.render.com/account/api-keys)" -AsSecureString
@@ -24,7 +24,7 @@ if (-not $renderKey) {
     [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
 }
 
-# Prompt for Vercel Token if not present in environment
+# 2. Prompt for Vercel Token if not present in environment
 $vercelToken = $env:VERCEL_TOKEN
 if (-not $vercelToken) {
     $secVercel = Read-Host "Enter Vercel Token (from vercel.com/account/tokens)" -AsSecureString
@@ -33,16 +33,26 @@ if (-not $vercelToken) {
     [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
 }
 
-if (-not $renderKey -or -not $vercelToken) {
-    Write-Host "❌ Error: Both Render API Key and Vercel Token are required." -ForegroundColor Red
+# 3. Prompt for Admin Test Password (never hardcoded in source)
+$adminPassword = $env:CYBERSHIELD_ADMIN_PASSWORD
+if (-not $adminPassword) {
+    $secPass = Read-Host "Enter CyberShield Admin Password (for live authentication test)" -AsSecureString
+    $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secPass)
+    $adminPassword = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
+    [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+}
+
+if (-not $renderKey -or -not $vercelToken -or -not $adminPassword) {
+    Write-Host "❌ Error: Render API Key, Vercel Token, and Admin Password are all required." -ForegroundColor Red
     exit 1
 }
 
 # Set in-memory environment variables for child process execution
 $env:RENDER_API_KEY = $renderKey
 $env:VERCEL_TOKEN = $vercelToken
+$env:CYBERSHIELD_ADMIN_PASSWORD = $adminPassword
 
-Write-Host "`n✅ Credentials loaded in process memory only (0 temporary files created)." -ForegroundColor Green
+Write-Host "`n✅ All credentials loaded into process memory only." -ForegroundColor Green
 Write-Host "🚀 Launching complete automated deployment orchestrator...`n" -ForegroundColor Green
 
 Set-Location $ScriptDir
@@ -58,8 +68,10 @@ try {
     # Immediately wipe credentials from environment memory
     Remove-Item env:RENDER_API_KEY -ErrorAction SilentlyContinue
     Remove-Item env:VERCEL_TOKEN -ErrorAction SilentlyContinue
+    Remove-Item env:CYBERSHIELD_ADMIN_PASSWORD -ErrorAction SilentlyContinue
     $renderKey = $null
     $vercelToken = $null
+    $adminPassword = $null
     [System.GC]::Collect()
     Write-Host "🔒 Process memory purged." -ForegroundColor Gray
 }

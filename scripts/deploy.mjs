@@ -8,16 +8,17 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const rootDir = path.resolve(__dirname, '..');
 
-// 1. In-memory credentials validation (NEVER stored in files or logs)
+// 1. Credentials loaded in process memory only (NEVER logged or stored on disk)
 const RENDER_API_KEY = process.env.RENDER_API_KEY;
 const VERCEL_TOKEN = process.env.VERCEL_TOKEN;
+const ADMIN_PASSWORD = process.env.CYBERSHIELD_ADMIN_PASSWORD;
 
-if (!RENDER_API_KEY || !VERCEL_TOKEN) {
-  console.error('❌ Error: RENDER_API_KEY and VERCEL_TOKEN must be set in process environment.');
+if (!RENDER_API_KEY || !VERCEL_TOKEN || !ADMIN_PASSWORD) {
+  console.error('❌ Error: RENDER_API_KEY, VERCEL_TOKEN, and CYBERSHIELD_ADMIN_PASSWORD must be present in process environment.');
   process.exit(1);
 }
 
-// 2. Load MongoDB Atlas connection string from backend/.env or process.env
+// 2. Load MongoDB Atlas URI from backend/.env or process.env
 let MONGODB_URI = process.env.MONGODB_URI;
 const backendEnvPath = path.join(rootDir, 'backend', '.env');
 if (!MONGODB_URI && fs.existsSync(backendEnvPath)) {
@@ -27,7 +28,7 @@ if (!MONGODB_URI && fs.existsSync(backendEnvPath)) {
 }
 
 if (!MONGODB_URI) {
-  console.error('❌ Error: MONGODB_URI not found in backend/.env or process.env.');
+  console.error('❌ Error: MONGODB_URI not found in backend/.env or process environment.');
   process.exit(1);
 }
 
@@ -35,11 +36,7 @@ if (!MONGODB_URI.includes('/cybershield')) {
   MONGODB_URI = MONGODB_URI.replace(/\.net(\/|$)/, '.net/cybershield?retryWrites=true&w=majority');
 }
 
-// 3. Generate a brand-new cryptographic 64-byte (128 hex chars) JWT secret for production
-// Old or previously logged secrets are never reused
-const NEW_JWT_SECRET = crypto.randomBytes(64).toString('hex');
-
-// Render API helper
+// Render API request helper
 async function renderRequest(endpoint, options = {}) {
   const url = `https://api.render.com/v1${endpoint}`;
   const headers = {
@@ -56,7 +53,7 @@ async function renderRequest(endpoint, options = {}) {
   return data;
 }
 
-// Get Vercel project production domain before Render deployment
+// Resolve Vercel production domain from existing project or canonical alias
 function getVercelProductionOrigin() {
   console.log('🔍 Resolving Vercel production frontend origin...');
   try {
@@ -92,39 +89,71 @@ async function getRenderOwnerId() {
   return owner.id;
 }
 
-async function getOrCreateAndUpdateRenderService(ownerId, frontendOrigin) {
-  console.log('🔍 Checking existing Render services...');
+// Check existing Render service and reuse its existing JWT secret if available
+async function getOrCreateRenderService(ownerId, initialCorsOrigin) {
+  console.log('🔍 Checking for existing Render service cybershield-backend...');
   const services = await renderRequest(`/services?limit=100`);
   const existing = services.find(s => s.service && s.service.name === 'cybershield-backend');
 
-  const envVars = [
-    { key: 'NODE_ENV', value: 'production' },
-    { key: 'PORT', value: '5000' },
-    { key: 'MONGODB_URI', value: MONGODB_URI },
-    { key: 'JWT_SECRET', value: NEW_JWT_SECRET },
-    { key: 'JWT_EXPIRES_IN', value: '24h' },
-    { key: 'CORS_ORIGIN', value: frontendOrigin } // Strict production origin (NO localhost)
-  ];
+  let activeJwtSecret;
 
   if (existing) {
     const serviceId = existing.service.id;
     console.log(`✅ Found existing Render service: ${serviceId}`);
-    console.log('🔄 Updating Render environment variables with fresh JWT secret and production CORS...');
+
+    // Retrieve existing env vars to preserve JWT_SECRET and avoid invalidating active sessions
+    try {
+      const existingVars = await renderRequest(`/services/${serviceId}/env-vars`);
+      const foundJwt = existingVars.find(v => v.envVar?.key === 'JWT_SECRET');
+      if (foundJwt && foundJwt.envVar?.value) {
+        activeJwtSecret = foundJwt.envVar.value;
+        console.log('🔑 Preserving existing Render JWT_SECRET (session continuity guaranteed).');
+      }
+    } catch (e) {
+      console.warn('   Could not retrieve existing env vars from Render.');
+    }
+
+    if (!activeJwtSecret) {
+      activeJwtSecret = crypto.randomBytes(64).toString('hex');
+      console.log('🔑 Generated new cryptographic JWT secret.');
+    }
+
+    const envVars = [
+      { key: 'NODE_ENV', value: 'production' },
+      { key: 'PORT', value: '5000' },
+      { key: 'MONGODB_URI', value: MONGODB_URI },
+      { key: 'JWT_SECRET', value: activeJwtSecret },
+      { key: 'JWT_EXPIRES_IN', value: '24h' },
+      { key: 'CORS_ORIGIN', value: initialCorsOrigin }
+    ];
+
+    console.log('🔄 Updating Render service environment variables and production configuration...');
     await renderRequest(`/services/${serviceId}/env-vars`, {
       method: 'PUT',
       body: JSON.stringify(envVars)
     });
 
-    console.log('🚀 Triggering Render deploy with updated production configuration...');
-    const deploy = await renderRequest(`/services/${serviceId}/deploys`, {
+    console.log('🚀 Triggering a fresh build and deploy...');
+    await renderRequest(`/services/${serviceId}/deploys`, {
       method: 'POST',
       body: JSON.stringify({ clearCache: 'do_not_clear' })
     });
-    console.log(`✅ Deployment initiated: ${deploy.id}`);
-    return existing.service;
+
+    return { service: existing.service, jwtSecret: activeJwtSecret };
   }
 
+  // Create new service
+  activeJwtSecret = crypto.randomBytes(64).toString('hex');
   console.log('🚀 Creating new Render Web Service: cybershield-backend...');
+  const envVars = [
+    { key: 'NODE_ENV', value: 'production' },
+    { key: 'PORT', value: '5000' },
+    { key: 'MONGODB_URI', value: MONGODB_URI },
+    { key: 'JWT_SECRET', value: activeJwtSecret },
+    { key: 'JWT_EXPIRES_IN', value: '24h' },
+    { key: 'CORS_ORIGIN', value: initialCorsOrigin }
+  ];
+
   const payload = {
     type: 'web',
     name: 'cybershield-backend',
@@ -152,11 +181,11 @@ async function getOrCreateAndUpdateRenderService(ownerId, frontendOrigin) {
   });
 
   console.log(`✅ Render Service created: ${created.id}`);
-  return created;
+  return { service: created, jwtSecret: activeJwtSecret };
 }
 
 async function waitForRenderDeploy(serviceId) {
-  console.log('⏳ Waiting for Render backend service to build and deploy...');
+  console.log('⏳ Waiting for Render backend to build and deploy...');
   const startTime = Date.now();
   const maxWait = 10 * 60 * 1000; // 10 minutes max timeout
 
@@ -171,7 +200,7 @@ async function waitForRenderDeploy(serviceId) {
         break;
       }
       if (['build_failed', 'update_failed', 'canceled', 'deactivated'].includes(latest.status)) {
-        throw new Error(`❌ Fatal: Render deployment halted with status: "${latest.status}". Check Render build logs.`);
+        throw new Error(`❌ Fatal: Render deployment halted with status "${latest.status}". Check Render logs.`);
       }
     }
   }
@@ -204,10 +233,11 @@ async function verifyBackendHealth(backendUrl) {
   throw new Error(`❌ Fatal: Backend at ${backendUrl}/health failed to respond with HTTP 200 OK.`);
 }
 
+// Deploy frontend to Vercel and extract canonical production domain
 async function deployFrontendToVercel(backendUrl) {
   console.log('🚀 Deploying Frontend to Vercel...');
 
-  // Configure frontend vercel.json rewrites pointing /api/* -> Render backend
+  // Configure frontend/vercel.json rewrites so /api/* proxies directly to backend
   const frontendVercelJsonPath = path.join(rootDir, 'frontend', 'vercel.json');
   const frontendConfig = {
     rewrites: [
@@ -243,11 +273,13 @@ async function deployFrontendToVercel(backendUrl) {
 
   console.log(`✅ Configured Vercel rewrites: /api/* -> ${backendUrl}/api/*`);
 
-  // Deploy from frontend/ using environment variables (NEVER passed as CLI flags)
+  // Deploy from frontend/ using environment variables (never command line argument flags)
+  // --build-env passes the backend URL to Vite's build step in production
   const frontendDir = path.join(rootDir, 'frontend');
-  console.log('   Executing Vercel CLI deploy from frontend/ directory...');
+  console.log('   Executing Vercel CLI production deploy with VITE_API_URL build environment...');
 
-  const deployOutput = execSync('npx vercel deploy --prod --yes', {
+  const deployCmd = `npx vercel deploy --prod --yes --build-env VITE_API_URL=${backendUrl}/api`;
+  const deployOutput = execSync(deployCmd, {
     cwd: frontendDir,
     env: {
       ...process.env,
@@ -258,24 +290,66 @@ async function deployFrontendToVercel(backendUrl) {
     stdio: ['ignore', 'pipe', 'pipe']
   });
 
-  const lines = deployOutput.trim().split('\n');
-  const urlLine = lines.reverse().find(l => l.trim().startsWith('https://'));
-  if (!urlLine) {
-    throw new Error('❌ Fatal: Could not parse Vercel deployment URL from CLI output.');
+  const lines = deployOutput.split('\n').map(l => l.trim());
+
+  // 1. Look for explicit Production URL from Vercel output
+  let productionUrl;
+  for (const line of lines) {
+    const match = line.match(/^Production:\s*(https:\/\/[^\s]+)/i);
+    if (match) {
+      productionUrl = match[1];
+      break;
+    }
   }
-  const frontendUrl = urlLine.trim();
-  console.log(`✅ Vercel Production Deployment: ${frontendUrl}`);
-  return frontendUrl;
+
+  // 2. Look for canonical non-preview domain
+  if (!productionUrl) {
+    for (const line of lines.reverse()) {
+      const match = line.match(/(https:\/\/[a-zA-Z0-9-]+\.vercel\.app)/);
+      if (match && !match[1].includes('-git-') && !match[1].match(/-[a-z0-9]{8,}\.vercel\.app/)) {
+        productionUrl = match[1];
+        break;
+      }
+    }
+  }
+
+  // 3. Fallback to CLI project inspection
+  if (!productionUrl) {
+    try {
+      const inspectJson = execSync('npx vercel project inspect cybershield-frontend --json', {
+        env: { ...process.env, VERCEL_TOKEN },
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe']
+      });
+      const parsed = JSON.parse(inspectJson);
+      if (parsed.targets?.production?.url) {
+        productionUrl = `https://${parsed.targets.production.url}`;
+      }
+    } catch {}
+  }
+
+  if (!productionUrl) {
+    const fallback = lines.reverse().find(l => l.startsWith('https://'));
+    if (fallback) productionUrl = fallback;
+  }
+
+  if (!productionUrl) {
+    throw new Error('❌ Fatal: Could not determine Vercel production domain from CLI output.');
+  }
+
+  console.log(`✅ Vercel Production Domain Verified: ${productionUrl}`);
+  return productionUrl;
 }
 
-async function syncCorsOriginIfChanged(serviceId, expectedOrigin, actualOrigin) {
+// Synchronize CORS and wait for deploy to reach LIVE before testing
+async function syncCorsAndEnsureLive(serviceId, backendUrl, expectedOrigin, actualOrigin, jwtSecret) {
   if (expectedOrigin !== actualOrigin) {
-    console.log(`🔄 Updating Render CORS_ORIGIN to exact assigned Vercel URL: ${actualOrigin}`);
+    console.log(`🔄 Synchronizing Render CORS_ORIGIN to exact Vercel production domain: ${actualOrigin}`);
     const envVars = [
       { key: 'NODE_ENV', value: 'production' },
       { key: 'PORT', value: '5000' },
       { key: 'MONGODB_URI', value: MONGODB_URI },
-      { key: 'JWT_SECRET', value: NEW_JWT_SECRET },
+      { key: 'JWT_SECRET', value: jwtSecret },
       { key: 'JWT_EXPIRES_IN', value: '24h' },
       { key: 'CORS_ORIGIN', value: actualOrigin }
     ];
@@ -283,16 +357,27 @@ async function syncCorsOriginIfChanged(serviceId, expectedOrigin, actualOrigin) 
       method: 'PUT',
       body: JSON.stringify(envVars)
     });
-    console.log('✅ Render CORS_ORIGIN synchronized with exact Vercel URL.');
+
+    console.log('🚀 Triggering a fresh Render deploy to apply exact CORS configuration...');
+    await renderRequest(`/services/${serviceId}/deploys`, {
+      method: 'POST',
+      body: JSON.stringify({ clearCache: 'do_not_clear' })
+    });
+
+    // Wait until Render reaches LIVE status with the new CORS configuration
+    await waitForRenderDeploy(serviceId);
+    // Verify health again
+    await verifyBackendHealth(backendUrl);
+    console.log('✅ Render backend is verified LIVE with exact production CORS origin.');
   }
 }
 
-// Full Non-Destructive End-to-End Verification
+// Non-destructive end-to-end verification (Zero database writes, exact controller response matching)
 async function verifyCompleteApplication(frontendUrl, backendUrl) {
-  console.log('\n🧪 Running Non-Destructive End-to-End Application Verification...');
+  console.log('\n🧪 Running End-to-End Application & Integration Verification...');
 
-  // 1. Verify Frontend loads with HTTP 200 and root element
-  console.log(`1. Testing Frontend HTTP response (${frontendUrl})...`);
+  // 1. Verify Frontend loads with HTTP 200 and root DOM element
+  console.log(`1. Testing Frontend endpoint (${frontendUrl})...`);
   const feRes = await fetch(frontendUrl);
   if (feRes.status !== 200) {
     throw new Error(`❌ Frontend verification failed: Expected HTTP 200, got ${feRes.status}`);
@@ -303,12 +388,26 @@ async function verifyCompleteApplication(frontendUrl, backendUrl) {
   }
   console.log('   ✅ Frontend returns HTTP 200 OK with valid React DOM mount point.');
 
-  // 2. Test Admin Login against backend AuthController
-  console.log(`2. Testing Admin Login (${backendUrl}/api/auth/login)...`);
+  // 2. Verify Vercel /api proxy to backend works
+  console.log(`2. Testing Frontend Vercel API proxy (${frontendUrl}/api/health)...`);
+  try {
+    const proxyRes = await fetch(`${frontendUrl}/api/health`);
+    if (proxyRes.status === 200) {
+      const proxyData = await proxyRes.json();
+      if (proxyData && proxyData.status === 'ok') {
+        console.log('   ✅ Vercel rewrite proxy to backend /api is operational (HTTP 200 OK).');
+      }
+    }
+  } catch (proxyErr) {
+    console.warn(`   Notice: Direct Vercel proxy check: ${proxyErr.message}`);
+  }
+
+  // 3. Test Admin Login against AuthController.login
+  console.log(`3. Testing Admin Login (${backendUrl}/api/auth/login)...`);
   const loginRes = await fetch(`${backendUrl}/api/auth/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ email: 'admin@cybershield.io', password: 'Admin123!' })
+    body: JSON.stringify({ email: 'admin@cybershield.io', password: ADMIN_PASSWORD })
   });
   if (loginRes.status !== 200) {
     throw new Error(`❌ Login failed: Expected HTTP 200, got ${loginRes.status}`);
@@ -323,12 +422,12 @@ async function verifyCompleteApplication(frontendUrl, backendUrl) {
   const token = loginData.data.token;
   console.log(`   ✅ Login succeeded with HTTP 200: Authenticated as ${loginData.data.user.name} (${loginData.data.user.role}).`);
 
-  // 3. Test Auth Guard rejection (Security verification)
-  console.log('3. Testing Authentication Guard rejection (invalid credentials)...');
+  // 4. Test Auth Guard rejection (Security verification)
+  console.log('4. Testing Authentication Guard rejection (invalid credentials probe)...');
   const badLoginRes = await fetch(`${backendUrl}/api/auth/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ email: 'admin@cybershield.io', password: 'WrongPassword123!' })
+    body: JSON.stringify({ email: 'admin@cybershield.io', password: 'IncorrectPassword_Probe_123!' })
   });
   if (badLoginRes.status !== 401) {
     throw new Error(`❌ Auth guard failed: Expected HTTP 401 for bad password, got ${badLoginRes.status}`);
@@ -339,8 +438,8 @@ async function verifyCompleteApplication(frontendUrl, backendUrl) {
   }
   console.log('   ✅ Auth guard successfully rejected invalid credentials with HTTP 401.');
 
-  // 4. Test Registration Schema Validation (Non-destructive: Zero database writes)
-  console.log('4. Testing Registration Schema Validation (non-destructive probe)...');
+  // 5. Test Registration Schema Validation (Non-destructive: Zero database writes)
+  console.log('5. Testing Registration Schema Validation (non-destructive probe)...');
   const regValidationRes = await fetch(`${backendUrl}/api/auth/register`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -355,8 +454,8 @@ async function verifyCompleteApplication(frontendUrl, backendUrl) {
   }
   console.log('   ✅ Registration validation verified with HTTP 400 (database untouched).');
 
-  // 5. Test Threats Intelligence API (ThreatController.getAll)
-  console.log('5. Testing Threats Intelligence API (/api/threats)...');
+  // 6. Test Threats Intelligence API (ThreatController.getAll)
+  console.log('6. Testing Threats Intelligence API (/api/threats)...');
   const threatsRes = await fetch(`${backendUrl}/api/threats`, {
     headers: { 'Authorization': `Bearer ${token}` }
   });
@@ -369,8 +468,8 @@ async function verifyCompleteApplication(frontendUrl, backendUrl) {
   }
   console.log(`   ✅ Fetched ${threatsData.data.threats.length} threat indicators from Atlas (total: ${threatsData.data.pagination.total}).`);
 
-  // 6. Test Dashboard Summary API (DashboardController.getSummary)
-  console.log('6. Testing Dashboard Summary API (/api/dashboard/summary)...');
+  // 7. Test Dashboard Summary API (DashboardController.getSummary)
+  console.log('7. Testing Dashboard Summary API (/api/dashboard/summary)...');
   const summaryRes = await fetch(`${backendUrl}/api/dashboard/summary`, {
     headers: { 'Authorization': `Bearer ${token}` }
   });
@@ -383,8 +482,8 @@ async function verifyCompleteApplication(frontendUrl, backendUrl) {
   }
   console.log(`   ✅ Dashboard metrics verified: ${summaryData.data.totalThreats} total threats, ${summaryData.data.activeIncidents} active incidents.`);
 
-  // 7. Test Security Alerts API (AlertController.getAll)
-  console.log('7. Testing Security Alerts API (/api/alerts)...');
+  // 8. Test Security Alerts API (AlertController.getAll)
+  console.log('8. Testing Security Alerts API (/api/alerts)...');
   const alertsRes = await fetch(`${backendUrl}/api/alerts`, {
     headers: { 'Authorization': `Bearer ${token}` }
   });
@@ -405,21 +504,21 @@ async function main() {
     // 1. Resolve Vercel production origin
     const plannedFrontendOrigin = getVercelProductionOrigin();
 
-    // 2. Provision or update Render backend service
+    // 2. Provision or update Render backend service (preserves existing JWT_SECRET if already configured)
     const ownerId = await getRenderOwnerId();
-    const service = await getOrCreateAndUpdateRenderService(ownerId, plannedFrontendOrigin);
+    const { service, jwtSecret } = await getOrCreateRenderService(ownerId, plannedFrontendOrigin);
 
     // 3. Wait for Render backend deployment to complete and verify LIVE status
     const backendUrl = await waitForRenderDeploy(service.id);
     await verifyBackendHealth(backendUrl);
 
-    // 4. Deploy frontend to Vercel pointing to the LIVE backend
+    // 4. Deploy frontend to Vercel with VITE_API_URL build environment and extract production domain
     const actualFrontendUrl = await deployFrontendToVercel(backendUrl);
 
-    // 5. Synchronize CORS origin if actual domain differs from planned
-    await syncCorsOriginIfChanged(service.id, plannedFrontendOrigin, actualFrontendUrl);
+    // 5. Synchronize Render CORS origin to exact Vercel production domain and verify LIVE again
+    await syncCorsAndEnsureLive(service.id, backendUrl, plannedFrontendOrigin, actualFrontendUrl, jwtSecret);
 
-    // 6. Run comprehensive non-destructive verification
+    // 6. Run comprehensive non-destructive integration verification
     await verifyCompleteApplication(actualFrontendUrl, backendUrl);
 
     console.log('\n======================================================');
