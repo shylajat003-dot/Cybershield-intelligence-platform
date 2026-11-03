@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  Secure automated deployment runner for CyberShield Intelligence Platform
+  Secure in-memory deployment launcher for CyberShield Intelligence Platform
 #>
 
 [CmdletBinding()]
@@ -13,9 +13,9 @@ Write-Host "==========================================================" -Foregro
 Write-Host "🛡️  CyberShield Automated Deployment Credential Setup" -ForegroundColor Cyan
 Write-Host "==========================================================" -ForegroundColor Cyan
 Write-Host "Your tokens are entered securely via masked inputs (*)." -ForegroundColor Gray
-Write-Host "They are NEVER logged or displayed in chat.`n" -ForegroundColor Gray
+Write-Host "They are held in process memory only - NEVER written to disk.`n" -ForegroundColor Gray
 
-# Prompt for Render API Key if not already present in environment
+# Prompt for Render API Key if not present in environment
 $renderKey = $env:RENDER_API_KEY
 if (-not $renderKey) {
     $secRender = Read-Host "Enter Render API Key (from dashboard.render.com/account/api-keys)" -AsSecureString
@@ -24,7 +24,7 @@ if (-not $renderKey) {
     [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
 }
 
-# Prompt for Vercel Token if not already present in environment
+# Prompt for Vercel Token if not present in environment
 $vercelToken = $env:VERCEL_TOKEN
 if (-not $vercelToken) {
     $secVercel = Read-Host "Enter Vercel Token (from vercel.com/account/tokens)" -AsSecureString
@@ -34,34 +34,32 @@ if (-not $vercelToken) {
 }
 
 if (-not $renderKey -or -not $vercelToken) {
-    Write-Host "❌ Error: Both keys are required to proceed." -ForegroundColor Red
+    Write-Host "❌ Error: Both Render API Key and Vercel Token are required." -ForegroundColor Red
     exit 1
 }
 
-# Write securely to local gitignored .deploy-credentials.env
-$credsFile = Join-Path $ScriptDir ".deploy-credentials.env"
-$credsContent = @"
-RENDER_API_KEY=$renderKey
-VERCEL_TOKEN=$vercelToken
-"@
-Set-Content -Path $credsFile -Value $credsContent -Encoding UTF8
+# Set in-memory environment variables for child process execution
+$env:RENDER_API_KEY = $renderKey
+$env:VERCEL_TOKEN = $vercelToken
 
-Write-Host "`n✅ Credentials loaded securely in memory." -ForegroundColor Green
+Write-Host "`n✅ Credentials loaded in process memory only (0 temporary files created)." -ForegroundColor Green
 Write-Host "🚀 Launching complete automated deployment orchestrator...`n" -ForegroundColor Green
 
-# Run Node deploy orchestrator inside a try-finally block for security
 Set-Location $ScriptDir
 try {
+    # Execute the deploy orchestrator
     node scripts/deploy.mjs
     if ($LASTEXITCODE -eq 0) {
         Write-Host "`n🎉 Deployment & Verification Finished Successfully!" -ForegroundColor Green
     } else {
-        Write-Host "`n❌ Deployment encountered an issue. See log above." -ForegroundColor Red
+        Write-Host "`n❌ Deployment exited with error code $LASTEXITCODE. See details above." -ForegroundColor Red
     }
 } finally {
-    if (Test-Path $credsFile) {
-        Remove-Item $credsFile -Force
-        Write-Host "🔒 Temporary credentials purged from disk." -ForegroundColor Gray
-    }
+    # Immediately wipe credentials from environment memory
+    Remove-Item env:RENDER_API_KEY -ErrorAction SilentlyContinue
+    Remove-Item env:VERCEL_TOKEN -ErrorAction SilentlyContinue
+    $renderKey = $null
+    $vercelToken = $null
+    [System.GC]::Collect()
+    Write-Host "🔒 Process memory purged." -ForegroundColor Gray
 }
-
