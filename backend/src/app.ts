@@ -29,8 +29,12 @@ app.use(helmet({
   crossOriginEmbedderPolicy: false,
 }));
 
+const allowedOrigins = env.CORS_ORIGIN === '*'
+  ? true
+  : env.CORS_ORIGIN.split(',').map((s) => s.trim());
+
 app.use(cors({
-  origin: env.CORS_ORIGIN === '*' ? '*' : env.CORS_ORIGIN.split(','),
+  origin: allowedOrigins,
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],

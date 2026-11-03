@@ -45,7 +45,8 @@ export const Alerts: React.FC = () => {
     if (!token) return;
 
     // Open SSE stream â€” backend polls DB every 15s and pushes new alerts
-    const sse = new EventSource(`/api/alerts/stream?token=${encodeURIComponent(token)}`);
+    const apiBase = (import.meta.env.VITE_API_URL || '/api').replace(/\/$/, '');
+    const sse = new EventSource(`${apiBase}/alerts/stream?token=${encodeURIComponent(token)}`);
     sseRef.current = sse;
 
     sse.onopen = () => {
