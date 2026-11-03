@@ -49,12 +49,19 @@ Set-Content -Path $credsFile -Value $credsContent -Encoding UTF8
 Write-Host "`n✅ Credentials loaded securely in memory." -ForegroundColor Green
 Write-Host "🚀 Launching complete automated deployment orchestrator...`n" -ForegroundColor Green
 
-# Run Node deploy orchestrator
+# Run Node deploy orchestrator inside a try-finally block for security
 Set-Location $ScriptDir
-node scripts/deploy.mjs
-
-if ($LASTEXITCODE -eq 0) {
-    Write-Host "`n🎉 Deployment & Verification Finished Successfully!" -ForegroundColor Green
-} else {
-    Write-Host "`n❌ Deployment encountered an issue. See log above." -ForegroundColor Red
+try {
+    node scripts/deploy.mjs
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "`n🎉 Deployment & Verification Finished Successfully!" -ForegroundColor Green
+    } else {
+        Write-Host "`n❌ Deployment encountered an issue. See log above." -ForegroundColor Red
+    }
+} finally {
+    if (Test-Path $credsFile) {
+        Remove-Item $credsFile -Force
+        Write-Host "🔒 Temporary credentials purged from disk." -ForegroundColor Gray
+    }
 }
+

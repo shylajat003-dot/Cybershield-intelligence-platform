@@ -29,8 +29,38 @@ if (!RENDER_API_KEY || !VERCEL_TOKEN) {
   process.exit(1);
 }
 
-const MONGODB_URI = "mongodb+srv://shylajat003_db_user:aFqVnH932ZRD8diM@cluster0.bjtbzzh.mongodb.net/cybershield?retryWrites=true&w=majority";
-const JWT_SECRET = "e7accec8501b6cfd48f410d83faef46860b9ef34a64fb975157ac639d50c43944047a8570dbc3e5e61bc2b8ed3c86d57";
+// Load MONGODB_URI and JWT_SECRET from environment or backend/.env
+let MONGODB_URI = process.env.MONGODB_URI;
+let JWT_SECRET = process.env.JWT_SECRET;
+
+const backendEnvPath = path.join(rootDir, 'backend', '.env');
+if (fs.existsSync(backendEnvPath)) {
+  const bEnv = fs.readFileSync(backendEnvPath, 'utf8');
+  if (!MONGODB_URI) {
+    const mUri = bEnv.match(/^MONGODB_URI=["']?([^"'\r\n]+)["']?/m);
+    if (mUri) MONGODB_URI = mUri[1];
+  }
+  if (!JWT_SECRET) {
+    const mJwt = bEnv.match(/^JWT_SECRET=["']?([^"'\r\n]+)["']?/m);
+    if (mJwt) JWT_SECRET = mJwt[1];
+  }
+}
+
+// Fallback to cryptographic generation for JWT_SECRET if none was provided
+if (!JWT_SECRET) {
+  const crypto = await import('crypto');
+  JWT_SECRET = crypto.randomBytes(48).toString('hex');
+}
+
+// Ensure database name is included in MONGODB_URI
+if (MONGODB_URI && !MONGODB_URI.includes('/cybershield')) {
+  MONGODB_URI = MONGODB_URI.replace(/\.net(\/|$)/, '.net/cybershield?retryWrites=true&w=majority');
+}
+
+if (!MONGODB_URI) {
+  console.error('❌ Error: MONGODB_URI not found in environment or backend/.env');
+  process.exit(1);
+}
 
 async function renderRequest(endpoint, options = {}) {
   const url = `https://api.render.com/v1${endpoint}`;
@@ -308,3 +338,4 @@ async function main() {
 }
 
 main();
+
