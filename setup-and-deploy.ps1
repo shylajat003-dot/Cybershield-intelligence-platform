@@ -56,13 +56,15 @@ Write-Host "`n✅ All credentials loaded into process memory only." -ForegroundC
 Write-Host "🚀 Launching complete automated deployment orchestrator...`n" -ForegroundColor Green
 
 Set-Location $ScriptDir
+$deployExitCode = 0
 try {
     # Execute the deploy orchestrator
     node scripts/deploy.mjs
-    if ($LASTEXITCODE -eq 0) {
+    $deployExitCode = $LASTEXITCODE
+    if ($deployExitCode -eq 0) {
         Write-Host "`n🎉 Deployment & Verification Finished Successfully!" -ForegroundColor Green
     } else {
-        Write-Host "`n❌ Deployment exited with error code $LASTEXITCODE. See details above." -ForegroundColor Red
+        Write-Host "`n❌ Deployment exited with error code $deployExitCode. See details above." -ForegroundColor Red
     }
 } finally {
     # Immediately wipe credentials from environment memory
@@ -74,4 +76,7 @@ try {
     $adminPassword = $null
     [System.GC]::Collect()
     Write-Host "🔒 Process memory purged." -ForegroundColor Gray
+    if ($deployExitCode -ne 0) {
+        exit $deployExitCode
+    }
 }
