@@ -3,22 +3,21 @@ import path from 'path';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { execSync } from 'child_process';
-import mongoose from 'mongoose';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const rootDir = path.resolve(__dirname, '..');
 
-// 1. In-memory credentials validation (NEVER written to disk or temp files)
+// 1. In-memory credentials validation (NEVER stored in files or logs)
 const RENDER_API_KEY = process.env.RENDER_API_KEY;
 const VERCEL_TOKEN = process.env.VERCEL_TOKEN;
 
 if (!RENDER_API_KEY || !VERCEL_TOKEN) {
-  console.error('❌ Error: Both RENDER_API_KEY and VERCEL_TOKEN must be provided via environment variables.');
+  console.error('❌ Error: RENDER_API_KEY and VERCEL_TOKEN must be set in process environment.');
   process.exit(1);
 }
 
-// 2. Load MongoDB Atlas URI from backend/.env or process.env
+// 2. Load MongoDB Atlas connection string from backend/.env or process.env
 let MONGODB_URI = process.env.MONGODB_URI;
 const backendEnvPath = path.join(rootDir, 'backend', '.env');
 if (!MONGODB_URI && fs.existsSync(backendEnvPath)) {
@@ -28,20 +27,19 @@ if (!MONGODB_URI && fs.existsSync(backendEnvPath)) {
 }
 
 if (!MONGODB_URI) {
-  console.error('❌ Error: MONGODB_URI not found in backend/.env or environment.');
+  console.error('❌ Error: MONGODB_URI not found in backend/.env or process.env.');
   process.exit(1);
 }
 
-// Ensure database name is in URI
 if (!MONGODB_URI.includes('/cybershield')) {
   MONGODB_URI = MONGODB_URI.replace(/\.net(\/|$)/, '.net/cybershield?retryWrites=true&w=majority');
 }
 
-// 3. Generate a brand-new high-entropy cryptographic JWT secret (64 bytes / 128 hex chars)
-// Never reuses any previously exposed keys
+// 3. Generate a brand-new cryptographic 64-byte (128 hex chars) JWT secret for production
+// Old or previously logged secrets are never reused
 const NEW_JWT_SECRET = crypto.randomBytes(64).toString('hex');
 
-// Render API helper (no secret logging)
+// Render API helper
 async function renderRequest(endpoint, options = {}) {
   const url = `https://api.render.com/v1${endpoint}`;
   const headers = {
@@ -58,24 +56,71 @@ async function renderRequest(endpoint, options = {}) {
   return data;
 }
 
+// Get Vercel project production domain before Render deployment
+function getVercelProductionOrigin() {
+  console.log('🔍 Resolving Vercel production frontend origin...');
+  try {
+    const listJson = execSync('npx vercel project ls --json', {
+      env: { ...process.env, VERCEL_TOKEN },
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    const parsed = JSON.parse(listJson);
+    const projects = Array.isArray(parsed) ? parsed : (parsed.projects || []);
+    const existing = projects.find(p => p.name === 'cybershield-frontend');
+    if (existing && existing.targets?.production?.url) {
+      const origin = `https://${existing.targets.production.url}`;
+      console.log(`✅ Found existing Vercel project production domain: ${origin}`);
+      return origin;
+    }
+  } catch (err) {
+    // If project ls fails or JSON format differs, use canonical Vercel alias
+  }
+  const defaultOrigin = 'https://cybershield-frontend.vercel.app';
+  console.log(`✅ Using canonical Vercel production domain: ${defaultOrigin}`);
+  return defaultOrigin;
+}
+
 async function getRenderOwnerId() {
   console.log('🔍 Fetching Render account owner info...');
   const owners = await renderRequest('/owners');
   if (!owners || owners.length === 0) {
-    throw new Error('No Render owners/workspaces found for this API key.');
+    throw new Error('No Render owners or workspaces found for this API key.');
   }
   const owner = owners[0].owner;
   console.log(`✅ Using Render Owner: ${owner.name || owner.email} (${owner.id})`);
   return owner.id;
 }
 
-async function getOrCreateRenderService(ownerId) {
-  console.log('🔍 Checking for existing Render service cybershield-backend...');
+async function getOrCreateAndUpdateRenderService(ownerId, frontendOrigin) {
+  console.log('🔍 Checking existing Render services...');
   const services = await renderRequest(`/services?limit=100`);
   const existing = services.find(s => s.service && s.service.name === 'cybershield-backend');
-  
+
+  const envVars = [
+    { key: 'NODE_ENV', value: 'production' },
+    { key: 'PORT', value: '5000' },
+    { key: 'MONGODB_URI', value: MONGODB_URI },
+    { key: 'JWT_SECRET', value: NEW_JWT_SECRET },
+    { key: 'JWT_EXPIRES_IN', value: '24h' },
+    { key: 'CORS_ORIGIN', value: frontendOrigin } // Strict production origin (NO localhost)
+  ];
+
   if (existing) {
-    console.log(`✅ Found existing Render service: ${existing.service.id}`);
+    const serviceId = existing.service.id;
+    console.log(`✅ Found existing Render service: ${serviceId}`);
+    console.log('🔄 Updating Render environment variables with fresh JWT secret and production CORS...');
+    await renderRequest(`/services/${serviceId}/env-vars`, {
+      method: 'PUT',
+      body: JSON.stringify(envVars)
+    });
+
+    console.log('🚀 Triggering Render deploy with updated production configuration...');
+    const deploy = await renderRequest(`/services/${serviceId}/deploys`, {
+      method: 'POST',
+      body: JSON.stringify({ clearCache: 'do_not_clear' })
+    });
+    console.log(`✅ Deployment initiated: ${deploy.id}`);
     return existing.service;
   }
 
@@ -97,14 +142,7 @@ async function getOrCreateRenderService(ownerId) {
         startCommand: 'npm run start'
       },
       healthCheckPath: '/health',
-      envVars: [
-        { key: 'NODE_ENV', value: 'production' },
-        { key: 'PORT', value: '5000' },
-        { key: 'MONGODB_URI', value: MONGODB_URI },
-        { key: 'JWT_SECRET', value: NEW_JWT_SECRET },
-        { key: 'JWT_EXPIRES_IN', value: '24h' },
-        { key: 'CORS_ORIGIN', value: 'http://localhost:5173' } // will be updated with exact Vercel URL
-      ]
+      envVars
     }
   };
 
@@ -117,28 +155,10 @@ async function getOrCreateRenderService(ownerId) {
   return created;
 }
 
-async function updateRenderEnvVars(serviceId, frontendOrigin) {
-  console.log(`🔐 Updating Render CORS_ORIGIN to exact frontend origin: ${frontendOrigin}`);
-  const envVars = [
-    { key: 'NODE_ENV', value: 'production' },
-    { key: 'PORT', value: '5000' },
-    { key: 'MONGODB_URI', value: MONGODB_URI },
-    { key: 'JWT_SECRET', value: NEW_JWT_SECRET },
-    { key: 'JWT_EXPIRES_IN', value: '24h' },
-    { key: 'CORS_ORIGIN', value: `${frontendOrigin},http://localhost:5173` }
-  ];
-
-  await renderRequest(`/services/${serviceId}/env-vars`, {
-    method: 'PUT',
-    body: JSON.stringify(envVars)
-  });
-  console.log('✅ Render environment variables updated with exact CORS origin and new secure JWT secret.');
-}
-
 async function waitForRenderDeploy(serviceId) {
-  console.log('⏳ Waiting for Render backend to build and deploy...');
+  console.log('⏳ Waiting for Render backend service to build and deploy...');
   const startTime = Date.now();
-  const maxWait = 10 * 60 * 1000; // 10 minutes max wait
+  const maxWait = 10 * 60 * 1000; // 10 minutes max timeout
 
   while (Date.now() - startTime < maxWait) {
     await new Promise(r => setTimeout(r, 15000));
@@ -147,11 +167,11 @@ async function waitForRenderDeploy(serviceId) {
       const latest = deploys[0].deploy;
       console.log(`   Deploy status: ${latest.status}...`);
       if (latest.status === 'live') {
-        console.log('✅ Render deploy reached LIVE status!');
+        console.log('✅ Render deploy reached LIVE status successfully!');
         break;
       }
       if (['build_failed', 'update_failed', 'canceled', 'deactivated'].includes(latest.status)) {
-        throw new Error(`❌ Render deployment stopped: Service reached fatal status "${latest.status}".`);
+        throw new Error(`❌ Fatal: Render deployment halted with status: "${latest.status}". Check Render build logs.`);
       }
     }
   }
@@ -159,25 +179,25 @@ async function waitForRenderDeploy(serviceId) {
   const s = await renderRequest(`/services/${serviceId}`);
   const backendUrl = s.serviceDetails?.url;
   if (!backendUrl) {
-    throw new Error('Render did not return a public service URL.');
+    throw new Error('❌ Fatal: Render did not return a valid public URL.');
   }
   return backendUrl.replace(/\/$/, '');
 }
 
-async function testBackendHealth(backendUrl) {
-  console.log(`🔍 Verifying backend health at ${backendUrl}/health...`);
+async function verifyBackendHealth(backendUrl) {
+  console.log(`🔍 Checking backend health endpoint at ${backendUrl}/health...`);
   for (let i = 0; i < 12; i++) {
     try {
       const res = await fetch(`${backendUrl}/health`);
       if (res.status === 200) {
-        const data = await res.json();
-        if (data && data.status === 'ok') {
-          console.log('✅ Backend health check passed with HTTP 200 OK:', data);
+        const body = await res.json();
+        if (body && body.status === 'ok') {
+          console.log('✅ Backend health check passed: HTTP 200 OK (service is operational).');
           return true;
         }
       }
-    } catch (e) {
-      console.log(`   Waiting for backend service to respond (${i + 1}/12)...`);
+    } catch {
+      console.log(`   Waiting for backend to respond (${i + 1}/12)...`);
       await new Promise(r => setTimeout(r, 5000));
     }
   }
@@ -187,7 +207,7 @@ async function testBackendHealth(backendUrl) {
 async function deployFrontendToVercel(backendUrl) {
   console.log('🚀 Deploying Frontend to Vercel...');
 
-  // Configure vercel.json rewrites so /api/* proxies directly to backend
+  // Configure frontend vercel.json rewrites pointing /api/* -> Render backend
   const frontendVercelJsonPath = path.join(rootDir, 'frontend', 'vercel.json');
   const frontendConfig = {
     rewrites: [
@@ -203,6 +223,7 @@ async function deployFrontendToVercel(backendUrl) {
   };
   fs.writeFileSync(frontendVercelJsonPath, JSON.stringify(frontendConfig, null, 2), 'utf8');
 
+  // Configure root vercel.json as well for root-linked deployments
   const rootVercelJsonPath = path.join(rootDir, 'vercel.json');
   const rootConfig = {
     buildCommand: 'cd frontend && npm install && npm run build',
@@ -220,12 +241,12 @@ async function deployFrontendToVercel(backendUrl) {
   };
   fs.writeFileSync(rootVercelJsonPath, JSON.stringify(rootConfig, null, 2), 'utf8');
 
-  console.log(`✅ Configured Vercel rewrites pointing /api/* -> ${backendUrl}/api/*`);
+  console.log(`✅ Configured Vercel rewrites: /api/* -> ${backendUrl}/api/*`);
 
-  // Execute Vercel deploy using environment variable (NEVER command line argument)
+  // Deploy from frontend/ using environment variables (NEVER passed as CLI flags)
   const frontendDir = path.join(rootDir, 'frontend');
-  console.log('   Executing Vercel CLI deploy (credentials passed via process environment)...');
-  
+  console.log('   Executing Vercel CLI deploy from frontend/ directory...');
+
   const deployOutput = execSync('npx vercel deploy --prod --yes', {
     cwd: frontendDir,
     env: {
@@ -240,18 +261,38 @@ async function deployFrontendToVercel(backendUrl) {
   const lines = deployOutput.trim().split('\n');
   const urlLine = lines.reverse().find(l => l.trim().startsWith('https://'));
   if (!urlLine) {
-    throw new Error('❌ Could not find Vercel deployment URL in CLI output.');
+    throw new Error('❌ Fatal: Could not parse Vercel deployment URL from CLI output.');
   }
   const frontendUrl = urlLine.trim();
   console.log(`✅ Vercel Production Deployment: ${frontendUrl}`);
   return frontendUrl;
 }
 
-async function verifyCompleteApplication(frontendUrl, backendUrl) {
-  console.log('\n🧪 Running End-to-End Application & Integration Verification...');
+async function syncCorsOriginIfChanged(serviceId, expectedOrigin, actualOrigin) {
+  if (expectedOrigin !== actualOrigin) {
+    console.log(`🔄 Updating Render CORS_ORIGIN to exact assigned Vercel URL: ${actualOrigin}`);
+    const envVars = [
+      { key: 'NODE_ENV', value: 'production' },
+      { key: 'PORT', value: '5000' },
+      { key: 'MONGODB_URI', value: MONGODB_URI },
+      { key: 'JWT_SECRET', value: NEW_JWT_SECRET },
+      { key: 'JWT_EXPIRES_IN', value: '24h' },
+      { key: 'CORS_ORIGIN', value: actualOrigin }
+    ];
+    await renderRequest(`/services/${serviceId}/env-vars`, {
+      method: 'PUT',
+      body: JSON.stringify(envVars)
+    });
+    console.log('✅ Render CORS_ORIGIN synchronized with exact Vercel URL.');
+  }
+}
 
-  // 1. Verify Frontend HTTP 200 and HTML payload
-  console.log(`1. Testing Frontend endpoint (${frontendUrl})...`);
+// Full Non-Destructive End-to-End Verification
+async function verifyCompleteApplication(frontendUrl, backendUrl) {
+  console.log('\n🧪 Running Non-Destructive End-to-End Application Verification...');
+
+  // 1. Verify Frontend loads with HTTP 200 and root element
+  console.log(`1. Testing Frontend HTTP response (${frontendUrl})...`);
   const feRes = await fetch(frontendUrl);
   if (feRes.status !== 200) {
     throw new Error(`❌ Frontend verification failed: Expected HTTP 200, got ${feRes.status}`);
@@ -260,10 +301,10 @@ async function verifyCompleteApplication(frontendUrl, backendUrl) {
   if (!feHtml.includes('id="root"')) {
     throw new Error('❌ Frontend verification failed: Missing root DOM mount point.');
   }
-  console.log('   ✅ Frontend returns HTTP 200 OK with valid React DOM container.');
+  console.log('   ✅ Frontend returns HTTP 200 OK with valid React DOM mount point.');
 
-  // 2. Test Admin Login with status code and payload assertion
-  console.log(`2. Testing API Login (${backendUrl}/api/auth/login)...`);
+  // 2. Test Admin Login against backend AuthController
+  console.log(`2. Testing Admin Login (${backendUrl}/api/auth/login)...`);
   const loginRes = await fetch(`${backendUrl}/api/auth/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -273,46 +314,49 @@ async function verifyCompleteApplication(frontendUrl, backendUrl) {
     throw new Error(`❌ Login failed: Expected HTTP 200, got ${loginRes.status}`);
   }
   const loginData = await loginRes.json();
-  if (!loginData.success || typeof loginData.token !== 'string' || loginData.token.length < 20) {
-    throw new Error(`❌ Login failed: Invalid auth token response payload.`);
+  if (!loginData.success || !loginData.data?.token || loginData.data.token.length < 20) {
+    throw new Error(`❌ Login failed: Invalid token payload in response.`);
   }
-  const token = loginData.token;
-  console.log(`   ✅ Login succeeded with HTTP 200: Authenticated as ${loginData.user.name} (${loginData.user.role}).`);
+  if (loginData.data.user?.role !== 'ADMIN') {
+    throw new Error(`❌ Login failed: Expected ADMIN role, got ${loginData.data.user?.role}`);
+  }
+  const token = loginData.data.token;
+  console.log(`   ✅ Login succeeded with HTTP 200: Authenticated as ${loginData.data.user.name} (${loginData.data.user.role}).`);
 
-  // 3. Test Registration & immediate clean up of the verification record
-  console.log('3. Testing User Registration & Automatic Account Cleanup...');
-  const testEmail = `verify_${Date.now()}@cybershield.io`;
-  const regRes = await fetch(`${backendUrl}/api/auth/register`, {
+  // 3. Test Auth Guard rejection (Security verification)
+  console.log('3. Testing Authentication Guard rejection (invalid credentials)...');
+  const badLoginRes = await fetch(`${backendUrl}/api/auth/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      name: 'Verification Probe',
-      email: testEmail,
-      password: 'VerifyPassword123!',
-      role: 'SECURITY_ANALYST'
-    })
+    body: JSON.stringify({ email: 'admin@cybershield.io', password: 'WrongPassword123!' })
   });
-  if (regRes.status !== 201 && regRes.status !== 200) {
-    throw new Error(`❌ Registration failed: Expected HTTP 201/200, got ${regRes.status}`);
+  if (badLoginRes.status !== 401) {
+    throw new Error(`❌ Auth guard failed: Expected HTTP 401 for bad password, got ${badLoginRes.status}`);
   }
-  const regData = await regRes.json();
-  if (!regData.token) {
-    throw new Error('❌ Registration failed: No auth token returned in registration response.');
+  const badLoginData = await badLoginRes.json();
+  if (badLoginData.success !== false) {
+    throw new Error('❌ Auth guard failed: Expected success=false on invalid login.');
   }
-  console.log(`   ✅ Registration test passed: Temporary account created.`);
+  console.log('   ✅ Auth guard successfully rejected invalid credentials with HTTP 401.');
 
-  // Clean up ONLY this specific test user account in MongoDB Atlas
-  try {
-    await mongoose.connect(MONGODB_URI);
-    const deleteRes = await mongoose.connection.collection('users').deleteOne({ email: testEmail });
-    console.log(`   🧹 Database integrity preserved: Cleaned up temporary test user (${deleteRes.deletedCount} deleted).`);
-    await mongoose.disconnect();
-  } catch (cleanErr) {
-    console.warn(`   ⚠️ Notice during test account cleanup: ${cleanErr.message}`);
+  // 4. Test Registration Schema Validation (Non-destructive: Zero database writes)
+  console.log('4. Testing Registration Schema Validation (non-destructive probe)...');
+  const regValidationRes = await fetch(`${backendUrl}/api/auth/register`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: 'invalid-email-probe' }) // missing required fields
+  });
+  if (regValidationRes.status !== 400) {
+    throw new Error(`❌ Registration validation failed: Expected HTTP 400, got ${regValidationRes.status}`);
   }
+  const regValidationData = await regValidationRes.json();
+  if (regValidationData.success !== false) {
+    throw new Error('❌ Registration validation failed: Expected success=false on invalid payload.');
+  }
+  console.log('   ✅ Registration validation verified with HTTP 400 (database untouched).');
 
-  // 4. Test Threats Intelligence API
-  console.log('4. Testing Threats Intelligence API (/api/threats)...');
+  // 5. Test Threats Intelligence API (ThreatController.getAll)
+  console.log('5. Testing Threats Intelligence API (/api/threats)...');
   const threatsRes = await fetch(`${backendUrl}/api/threats`, {
     headers: { 'Authorization': `Bearer ${token}` }
   });
@@ -320,24 +364,27 @@ async function verifyCompleteApplication(frontendUrl, backendUrl) {
     throw new Error(`❌ Threats API failed: Expected HTTP 200, got ${threatsRes.status}`);
   }
   const threatsData = await threatsRes.json();
-  if (!Array.isArray(threatsData.threats) || threatsData.threats.length === 0) {
-    throw new Error('❌ Threats API failed: No threat records found in database.');
+  if (!threatsData.success || !Array.isArray(threatsData.data?.threats) || threatsData.data.threats.length === 0) {
+    throw new Error('❌ Threats API failed: Invalid or empty threats data structure.');
   }
-  console.log(`   ✅ Fetched ${threatsData.threats.length} threat indicators from Atlas.`);
+  console.log(`   ✅ Fetched ${threatsData.data.threats.length} threat indicators from Atlas (total: ${threatsData.data.pagination.total}).`);
 
-  // 5. Test Dashboard Stats API
-  console.log('5. Testing Dashboard Stats API (/api/dashboard/stats)...');
-  const statsRes = await fetch(`${backendUrl}/api/dashboard/stats`, {
+  // 6. Test Dashboard Summary API (DashboardController.getSummary)
+  console.log('6. Testing Dashboard Summary API (/api/dashboard/summary)...');
+  const summaryRes = await fetch(`${backendUrl}/api/dashboard/summary`, {
     headers: { 'Authorization': `Bearer ${token}` }
   });
-  if (statsRes.status !== 200) {
-    throw new Error(`❌ Dashboard stats failed: Expected HTTP 200, got ${statsRes.status}`);
+  if (summaryRes.status !== 200) {
+    throw new Error(`❌ Dashboard summary failed: Expected HTTP 200, got ${summaryRes.status}`);
   }
-  const statsData = await statsRes.json();
-  console.log('   ✅ Dashboard metrics verified successfully.');
+  const summaryData = await summaryRes.json();
+  if (!summaryData.success || typeof summaryData.data?.totalThreats !== 'number') {
+    throw new Error('❌ Dashboard summary failed: Missing numeric metrics.');
+  }
+  console.log(`   ✅ Dashboard metrics verified: ${summaryData.data.totalThreats} total threats, ${summaryData.data.activeIncidents} active incidents.`);
 
-  // 6. Test Security Alerts API
-  console.log('6. Testing Security Alerts API (/api/alerts)...');
+  // 7. Test Security Alerts API (AlertController.getAll)
+  console.log('7. Testing Security Alerts API (/api/alerts)...');
   const alertsRes = await fetch(`${backendUrl}/api/alerts`, {
     headers: { 'Authorization': `Bearer ${token}` }
   });
@@ -345,37 +392,43 @@ async function verifyCompleteApplication(frontendUrl, backendUrl) {
     throw new Error(`❌ Alerts API failed: Expected HTTP 200, got ${alertsRes.status}`);
   }
   const alertsData = await alertsRes.json();
-  if (!Array.isArray(alertsData.alerts)) {
-    throw new Error('❌ Alerts API failed: alerts array not returned.');
+  if (!alertsData.success || !Array.isArray(alertsData.data?.alerts)) {
+    throw new Error('❌ Alerts API failed: Invalid alerts data payload.');
   }
-  console.log(`   ✅ Alerts API verified: ${alertsData.alerts.length} security alerts returned.`);
+  console.log(`   ✅ Alerts API verified: ${alertsData.data.alerts.length} security alerts retrieved (total: ${alertsData.data.pagination.total}).`);
 
-  console.log('\n🎉 ALL VERIFICATION AND INTEGRATION TESTS PASSED 100%!');
+  console.log('\n🎉 ALL PRODUCTION INTEGRATION TESTS PASSED 100%!');
 }
 
 async function main() {
   try {
+    // 1. Resolve Vercel production origin
+    const plannedFrontendOrigin = getVercelProductionOrigin();
+
+    // 2. Provision or update Render backend service
     const ownerId = await getRenderOwnerId();
-    const service = await getOrCreateRenderService(ownerId);
+    const service = await getOrCreateAndUpdateRenderService(ownerId, plannedFrontendOrigin);
+
+    // 3. Wait for Render backend deployment to complete and verify LIVE status
     const backendUrl = await waitForRenderDeploy(service.id);
-    await testBackendHealth(backendUrl);
+    await verifyBackendHealth(backendUrl);
 
-    // Deploy frontend to Vercel
-    const frontendUrl = await deployFrontendToVercel(backendUrl);
+    // 4. Deploy frontend to Vercel pointing to the LIVE backend
+    const actualFrontendUrl = await deployFrontendToVercel(backendUrl);
 
-    // Update Render with exact Vercel CORS origin
-    await updateRenderEnvVars(service.id, frontendUrl);
+    // 5. Synchronize CORS origin if actual domain differs from planned
+    await syncCorsOriginIfChanged(service.id, plannedFrontendOrigin, actualFrontendUrl);
 
-    // Run end-to-end verification
-    await verifyCompleteApplication(frontendUrl, backendUrl);
+    // 6. Run comprehensive non-destructive verification
+    await verifyCompleteApplication(actualFrontendUrl, backendUrl);
 
     console.log('\n======================================================');
-    console.log('🏆 CYBERSHIELD INTELLIGENCE PLATFORM DEPLOYED!');
-    console.log(`🌐 Frontend URL: ${frontendUrl}`);
-    console.log(`⚙️  Backend URL:  ${backendUrl}`);
+    console.log('🏆 CYBERSHIELD INTELLIGENCE PLATFORM FULLY OPERATIONAL!');
+    console.log(`🌐 Public Frontend URL: ${actualFrontendUrl}`);
+    console.log(`⚙️  Public Backend URL:  ${backendUrl}`);
     console.log('======================================================\n');
   } catch (error) {
-    console.error('❌ Deployment process stopped:', error.message);
+    console.error('❌ Deployment process halted:', error.message);
     process.exit(1);
   }
 }
