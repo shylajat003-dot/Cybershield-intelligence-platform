@@ -7,6 +7,10 @@ export async function connectDB(): Promise<typeof mongoose> {
   if (mongoose.connection.readyState === 1) {
     return mongoose;
   }
+  if (mongoose.connection.readyState === 2) {
+    await new Promise((resolve) => mongoose.connection.once('connected', resolve));
+    return mongoose;
+  }
 
   const uri = env.MONGODB_URI;
 

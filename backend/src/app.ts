@@ -9,6 +9,10 @@ dotenv.config();
 
 import { env } from './config/env';
 import { errorHandler } from './middleware/errorMiddleware';
+import connectDB from './config/db';
+import { runMigrations } from './config/migrate';
+import { seedDatabase } from './config/seed';
+import { User } from './models';
 
 import authRoutes from './routes/authRoutes';
 import threatRoutes from './routes/threatRoutes';
@@ -65,7 +69,30 @@ if (process.env.NODE_ENV !== 'test') {
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
+// Database connection & migration check for serverless environments
+let dbReady = false;
+app.use(async (_req, _res, next) => {
+  if (!dbReady && process.env.NODE_ENV !== 'test') {
+    try {
+      await connectDB();
+      await runMigrations();
+      const userCount = await User.countDocuments({});
+      if (userCount === 0) {
+        await seedDatabase();
+      }
+      dbReady = true;
+    } catch (err: any) {
+      console.warn('DB initialization warning:', err?.message || err);
+    }
+  }
+  next();
+});
+
 // Health check
+app.get('/', (_req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString(), service: 'CyberShield API' });
+});
+
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString(), service: 'CyberShield API' });
 });
