@@ -17,6 +17,8 @@ backend/dist/
 .env.*
 !.env.example
 .deploy-credentials.env
+.vercel
+.vercel/
 
 # ─── Logs ──────────────────────────────────────────────────────────────────────
 logs/
